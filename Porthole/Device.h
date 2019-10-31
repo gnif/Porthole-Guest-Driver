@@ -27,25 +27,35 @@ EXTERN_C_START
 #pragma align(push, 4)
 typedef struct PortholeDeviceRegisters
 {
-	volatile UINT32 status;
+	volatile UINT32 cr;
+	volatile UINT32 type;
 
-	volatile UINT32 msg_cr;
-	volatile UINT32 msg_type;
-	volatile UINT32 msg_addr_l;
-	volatile UINT32 msg_addr_h;
-	volatile UINT32 msg_addr_size;
+	volatile union addr
+	{
+		UINT64 q;
+		UINT32 l;
+		UINT32 h;
+	}
+	addr;
+	volatile UINT32 size;
 
 	volatile UINT32 reserved1;
 	volatile UINT32 reserved2;
+	volatile UINT32 reserved3;
 }
 PortholeDeviceRegisters, *PPortholeDeviceRegisters;
+#pragma align(pop)
 
-#define PORTHOLE_REG_MSG_CR_RESET       (1 << 1)
-#define PORTHOLE_REG_MSG_CR_ADD_SEGMENT (1 << 2)
-#define PORTHOLE_REG_MSG_CR_FINISH      (1 << 3)
-#define PORTHOLE_REG_MSG_CR_TIMEOUT     (1 << 4)
-#define PORTHOLE_REG_MSG_CR_BADADDR     (1 << 5)
-#define PORTHOLE_REG_MSG_CR_NOCONN      (1 << 6)
+#define PH_REG_CR_START       (1 << 1) // SW=S, HW=C, start of a mapping
+#define PH_REG_CR_ADD_SEGMENT (1 << 2) // SW=S, HW=C, add a segment to mapping
+#define PH_REG_CR_FINISH      (1 << 3) // SW=S, HW=C, end of segments
+#define PH_REG_CR_UNMAP       (1 << 4) // SW=S, HW=C, unmap a segment
+
+#define PH_REG_CR_TIMEOUT     (1 << 5) // HW=S, HW=C, timeout occured
+#define PH_REG_CR_BADADDR     (1 << 6) // HW=S, HW=C, bad address specified
+#define PH_REG_CR_NOCONN      (1 << 7) // HW=S, HW=C, no client connection
+#define PH_REG_CR_NORES       (1 << 8) // HW=S, HW=C, no resources left
+#define PH_REG_CR_DEVERR      (1 << 9) // HW=S, HW=C, invalid device usage
 
 typedef struct _DEVICE_CONTEXT
 {

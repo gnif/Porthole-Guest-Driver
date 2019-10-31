@@ -24,6 +24,7 @@ EXTERN_C_START
 
 typedef struct _MDLInfo
 {
+	int    id;
 	PVOID  addr;
 	UINT32 size;
 	PMDL   mdl;
@@ -34,7 +35,8 @@ MDLInfo, *PMDLInfo;
 
 typedef struct _FILE_OBJECT_CONTEXT
 {
-	MDLInfo mdlList[PORTHOLE_MAX_LOCKS];
+	PDEVICE_CONTEXT deviceContext;
+	MDLInfo         mdlList[PORTHOLE_MAX_LOCKS];
 }
 FILE_OBJECT_CONTEXT, *PFILE_OBJECT_CONTEXT;
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(FILE_OBJECT_CONTEXT, FileGetContext)

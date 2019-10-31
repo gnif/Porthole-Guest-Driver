@@ -78,20 +78,18 @@ int main()
 
 	// send the message
 	PortholeMsg msg;
+	PortholeMapID id;
 	msg.type = 0x1;
 	msg.addr = msgSetup;
 	msg.size = sizeof(MsgSetup) + RING_SIZE;
 	DeviceIoControl(devHandle, IOCTL_PORTHOLE_SEND_MSG, &msg,
-		sizeof(PortholeMsg), NULL, 0, &returned, NULL);
+		sizeof(PortholeMsg), &id, sizeof(PortholeMapID), &returned, NULL);
 
 	printf("done.\n");
 
-	PortholeLockMsg lmsg;
-	lmsg.addr = msg.addr;
-	lmsg.size = msg.size;
 	DeviceIoControl(
 		devHandle, IOCTL_PORTHOLE_UNLOCK_BUFFER,
-		&lmsg    , sizeof(PortholeLockMsg),
+		&id, sizeof(PortholeMapID),
 		NULL     , 0,
 		&returned,
 		NULL);

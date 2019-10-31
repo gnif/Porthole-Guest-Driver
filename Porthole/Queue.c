@@ -28,7 +28,9 @@ SOFTWARE.
 #endif
 
 // forwards
-static NTSTATUS ioctl_send_msg     (const PDEVICE_CONTEXT DeviceContext, const PFILE_OBJECT_CONTEXT fileContext, const size_t OutputBufferLength, const size_t InputBufferLength, const WDFREQUEST Request, size_t * BytesReturned);
+static void wait_device(PortholeDeviceRegisters *regs, UINT32 mask, UINT32 value);
+static NTSTATUS check_success(const PortholeDeviceRegisters *regs);
+static NTSTATUS ioctl_send_msg(const PDEVICE_CONTEXT DeviceContext, const PFILE_OBJECT_CONTEXT fileContext, const size_t OutputBufferLength, const size_t InputBufferLength, const WDFREQUEST Request, size_t * BytesReturned);
 static NTSTATUS ioctl_unlock_buffer(const PDEVICE_CONTEXT DeviceContext, const PFILE_OBJECT_CONTEXT fileContext, const size_t OutputBufferLength, const size_t InputBufferLength, const WDFREQUEST Request, size_t * BytesReturned);
 
 void free_mdl(PMDL mdl)
@@ -88,6 +90,10 @@ PortholeEvtIoDeviceControl(
 			break;
 	}
 
+	// a disconnect invalidates all mappings
+	if (status == STATUS_DEVICE_NOT_CONNECTED)
+		PortholeDeviceFileCleanup(fileObject);
+
     WdfRequestCompleteWithInformation(Request, status, bytesReturned);
 }
 
@@ -105,59 +111,76 @@ VOID PortholeEvtIoStop(
 
 VOID PortholeDeviceFileCreate(WDFDEVICE Device, WDFREQUEST Request, WDFFILEOBJECT FileObject)
 {
-	UNREFERENCED_PARAMETER(Device);
 	UNREFERENCED_PARAMETER(Request);
+
 	PFILE_OBJECT_CONTEXT fileContext = FileGetContext(FileObject);
 	RtlZeroMemory(fileContext, sizeof(FILE_OBJECT_CONTEXT));
+	fileContext->deviceContext = DeviceGetContext(Device);
+
 	WdfRequestComplete(Request, STATUS_SUCCESS);
 }
 
 VOID PortholeDeviceFileCleanup(WDFFILEOBJECT FileObject)
 {
 	PFILE_OBJECT_CONTEXT fileContext = FileGetContext(FileObject);
+	const PDEVICE_CONTEXT deviceContext = fileContext->deviceContext;
 
 	for (int i = 0; i < PORTHOLE_MAX_LOCKS; ++i)
 		if (fileContext->mdlList[i].size)
 		{
-			free_mdl(fileContext->mdlList[i].mdl);
-			fileContext->mdlList[i].size = 0;
+			PMDLInfo info = &fileContext->mdlList[i];
+
+			/* tell the device about the unmapping */
+			deviceContext->regs->addr.q = info->id;
+			deviceContext->regs->cr |= PH_REG_CR_UNMAP;
+			wait_device(deviceContext->regs, PH_REG_CR_UNMAP, 0);
+
+			/* we don't check for errors here intentionally */
+
+			free_mdl(info->mdl);
+			info->size = 0;
 		}
 }
 
 static void wait_device(PortholeDeviceRegisters *regs, UINT32 mask, UINT32 value)
 {
 	LARGE_INTEGER delay = { 1 };
-	while ((regs->msg_cr & mask) != value)
+	while ((regs->cr & mask) != value)
 		KeDelayExecutionThread(KernelMode, FALSE, &delay);
 }
 
-static NTSTATUS check_success(PortholeDeviceRegisters *regs)
+static NTSTATUS check_success(const PortholeDeviceRegisters *regs)
 {
-	/* check for errors */
-	if (regs->msg_cr & PORTHOLE_REG_MSG_CR_BADADDR)
-		return STATUS_INVALID_DEVICE_REQUEST;
+	/* this must be checked first, a disconnect invalidates all mappings */
+	if (regs->cr & PH_REG_CR_NOCONN)
+		return STATUS_DEVICE_NOT_CONNECTED;
 
-	if (regs->msg_cr & PORTHOLE_REG_MSG_CR_TIMEOUT)
+	if (regs->cr & PH_REG_CR_TIMEOUT)
 		return STATUS_TIMEOUT;
 
-	if (regs->msg_cr & PORTHOLE_REG_MSG_CR_NOCONN)
-		return STATUS_DEVICE_NOT_CONNECTED;
+	if (regs->cr & PH_REG_CR_BADADDR)
+		return STATUS_INVALID_ADDRESS;
+
+	if (regs->cr & PH_REG_CR_NORES)
+		return STATUS_DEVICE_INSUFFICIENT_RESOURCES;
+
+	if (regs->cr & PH_REG_CR_DEVERR)
+		return STATUS_INVALID_DEVICE_REQUEST;
 
 	return STATUS_SUCCESS;
 }
 
 static NTSTATUS send_segment(PortholeDeviceRegisters *regs, UINT64 addr, UINT32 size)
 {
-	wait_device(regs, PORTHOLE_REG_MSG_CR_ADD_SEGMENT, 0x0);
+	wait_device(regs, PH_REG_CR_ADD_SEGMENT, 0x0);
 	NTSTATUS result = check_success(regs);
 	if (!NT_SUCCESS(result))
 		return result;
 
 	/* send the segment */
-	regs->msg_addr_l    = (addr >> 0) & 0xFFFFFFFF;
-	regs->msg_addr_h    = (addr >> 32) & 0xFFFFFFFF;
-	regs->msg_addr_size = size;
-	regs->msg_cr        = PORTHOLE_REG_MSG_CR_ADD_SEGMENT;
+	regs->addr.q = addr;
+	regs->size   = size;
+	regs->cr     = PH_REG_CR_ADD_SEGMENT;
 
 	return STATUS_SUCCESS;
 }
@@ -171,18 +194,22 @@ static NTSTATUS ioctl_send_msg(
 	size_t                   * BytesReturned
 )
 {
-	UNREFERENCED_PARAMETER(OutputBufferLength);
-	UNREFERENCED_PARAMETER(BytesReturned);
-
 	if (InputBufferLength != sizeof(PortholeMsg))
 		return STATUS_INVALID_BUFFER_SIZE;
 
-	PPortholeMsg buffer;
-	if (!NT_SUCCESS(WdfRequestRetrieveInputBuffer(Request, sizeof(PortholeMsg), (PVOID *)&buffer, NULL)))
+	if (OutputBufferLength != sizeof(PortholeMapID))
+		return STATUS_INVALID_BUFFER_SIZE;
+
+	PPortholeMsg   input;
+	PPortholeMapID output;
+	if (!NT_SUCCESS(WdfRequestRetrieveInputBuffer(Request, sizeof(PortholeMsg), (PVOID *)&input, NULL)))
+		return STATUS_INVALID_USER_BUFFER;
+
+	if (!NT_SUCCESS(WdfRequestRetrieveOutputBuffer(Request, sizeof(PortholeMapID), (PVOID *)&output, NULL)))
 		return STATUS_INVALID_USER_BUFFER;
 
 	/* ensure the supplied buffer size is valid */
-	if (buffer->size == 0)
+	if (input->size == 0)
 		return STATUS_INVALID_USER_BUFFER;
 
 	/* find a free mdl and reserve it */
@@ -191,8 +218,8 @@ static NTSTATUS ioctl_send_msg(
 		if (!FileContext->mdlList[i].size)
 		{
 			mdlInfo = &FileContext->mdlList[i];
-			mdlInfo->addr = buffer->addr;
-			mdlInfo->size = buffer->size;
+			mdlInfo->addr = input->addr;
+			mdlInfo->size = input->size;
 			break;
 		}
 
@@ -200,7 +227,7 @@ static NTSTATUS ioctl_send_msg(
 		return STATUS_DEVICE_INSUFFICIENT_RESOURCES;
 
 	/* allocate a MDL for the address provided */
-	PMDL mdl = IoAllocateMdl(buffer->addr, buffer->size, FALSE, FALSE, NULL);
+	PMDL mdl = IoAllocateMdl(input->addr, input->size, FALSE, FALSE, NULL);
 	if (!mdl)
 	{
 		mdlInfo->size = 0;
@@ -223,8 +250,8 @@ static NTSTATUS ioctl_send_msg(
 	NTSTATUS result;
 
 	/* tell the device we are about to send a list of segments */
-	DeviceContext->regs->msg_cr = PORTHOLE_REG_MSG_CR_RESET;
-	wait_device(DeviceContext->regs, PORTHOLE_REG_MSG_CR_RESET, 0x0);
+	DeviceContext->regs->cr = PH_REG_CR_START;
+	wait_device(DeviceContext->regs, PH_REG_CR_START, 0x0);
 	if (!NT_SUCCESS(result = check_success(DeviceContext->regs)))
 	{
 		free_mdl(mdl);
@@ -234,7 +261,7 @@ static NTSTATUS ioctl_send_msg(
 
 	ULONG   segSize   = 0;
 	ULONG64 lastPA    = 0;
-	UINT32  remaining = buffer->size;
+	UINT32  remaining = input->size;
 
 	for (PMDL curMdl = mdl; curMdl != NULL; curMdl = curMdl->Next)
 	{
@@ -285,7 +312,7 @@ static NTSTATUS ioctl_send_msg(
 	}
 
 	/* want for the final segment and check it's result */
-	wait_device(DeviceContext->regs, PORTHOLE_REG_MSG_CR_ADD_SEGMENT, 0x0);
+	wait_device(DeviceContext->regs, PH_REG_CR_ADD_SEGMENT, 0x0);
 	if (!NT_SUCCESS(result = check_success(DeviceContext->regs)))
 	{
 		free_mdl(mdl);
@@ -294,10 +321,18 @@ static NTSTATUS ioctl_send_msg(
 	}
 
 	/* send the final message */
-	DeviceContext->regs->msg_type = buffer->type;
-	DeviceContext->regs->msg_cr   = PORTHOLE_REG_MSG_CR_FINISH;
-	wait_device(DeviceContext->regs, PORTHOLE_REG_MSG_CR_FINISH, 0x0);
-	return check_success(DeviceContext->regs);
+	DeviceContext->regs->type = input->type;
+	DeviceContext->regs->cr   = PH_REG_CR_FINISH;
+	wait_device(DeviceContext->regs, PH_REG_CR_FINISH, 0x0);
+	result = check_success(DeviceContext->regs);
+	if (!NT_SUCCESS(result))
+		return result;
+
+	/* the mapping ID will be in the lower address register */
+	mdlInfo->id = DeviceContext->regs->addr.l;
+	*output = mdlInfo->id;
+	*BytesReturned = sizeof(PortholeMapID);
+	return STATUS_SUCCESS;
 }
 
 static NTSTATUS ioctl_unlock_buffer(
@@ -313,22 +348,28 @@ static NTSTATUS ioctl_unlock_buffer(
 	UNREFERENCED_PARAMETER(OutputBufferLength);
 	UNREFERENCED_PARAMETER(BytesReturned);
 
-	PPortholeLockMsg input;
+	PPortholeMapID input;
 
-	if (InputBufferLength != sizeof(PortholeLockMsg))
+	if (InputBufferLength != sizeof(PortholeMapID))
 		return STATUS_INVALID_BUFFER_SIZE;
 
-	if (!NT_SUCCESS(WdfRequestRetrieveInputBuffer(Request, sizeof(PortholeLockMsg), (PVOID *)&input, NULL)))
-		return STATUS_INVALID_USER_BUFFER;
-
-	if (input->size == 0)
+	if (!NT_SUCCESS(WdfRequestRetrieveInputBuffer(Request, sizeof(PortholeMapID), (PVOID *)&input, NULL)))
 		return STATUS_INVALID_USER_BUFFER;
 
 	for (int i = 0; i < PORTHOLE_MAX_LOCKS; ++i)
-		if (FileContext->mdlList[i].addr == input->addr && FileContext->mdlList[i].size == input->size)
+		if (FileContext->mdlList[i].size > 0 && FileContext->mdlList[i].id == *input)
 		{
-			free_mdl(FileContext->mdlList[i].mdl);
-			FileContext->mdlList[i].size = 0;
+			PMDLInfo info = &FileContext->mdlList[i];
+
+			DeviceContext->regs->addr.q = info->id;
+			DeviceContext->regs->cr |= PH_REG_CR_UNMAP;
+			wait_device(DeviceContext->regs, PH_REG_CR_UNMAP, 0);
+			NTSTATUS result = check_success(DeviceContext->regs);
+			if (!NT_SUCCESS(result))
+				return result;
+
+			free_mdl(info->mdl);
+			info->size = 0;
 			return STATUS_SUCCESS;
 		}
 
