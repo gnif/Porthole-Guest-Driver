@@ -57,6 +57,7 @@ NTSTATUS PortholeCreateDevice(_Inout_ PWDFDEVICE_INIT DeviceInit)
 
     deviceContext = DeviceGetContext(device);
 	RtlZeroMemory(deviceContext, sizeof(DEVICE_CONTEXT));
+	KeInitializeSpinLock(&deviceContext->deviceLock);
 
     status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_PORTHOLE, NULL);
 

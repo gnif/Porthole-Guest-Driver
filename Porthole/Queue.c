@@ -28,7 +28,7 @@ SOFTWARE.
 #endif
 
 // forwards
-static void wait_device(PortholeDeviceRegisters *regs, UINT32 mask, UINT32 value);
+static void wait_device(PortholeDeviceRegisters *regs, const UINT32 mask, const UINT32 value);
 static NTSTATUS check_success(const PortholeDeviceRegisters *regs);
 static NTSTATUS ioctl_send_msg(const PDEVICE_CONTEXT DeviceContext, const PFILE_OBJECT_CONTEXT fileContext, const size_t OutputBufferLength, const size_t InputBufferLength, const WDFREQUEST Request, size_t * BytesReturned);
 static NTSTATUS ioctl_unlock_buffer(const PDEVICE_CONTEXT DeviceContext, const PFILE_OBJECT_CONTEXT fileContext, const size_t OutputBufferLength, const size_t InputBufferLength, const WDFREQUEST Request, size_t * BytesReturned);
@@ -125,13 +125,16 @@ VOID PortholeDeviceFileCleanup(WDFFILEOBJECT FileObject)
 	PFILE_OBJECT_CONTEXT fileContext = FileGetContext(FileObject);
 	const PDEVICE_CONTEXT deviceContext = fileContext->deviceContext;
 
+	KIRQL oldIRQL;
+	KeAcquireSpinLock(&deviceContext->deviceLock, &oldIRQL);
 	for (int i = 0; i < PORTHOLE_MAX_LOCKS; ++i)
 		if (fileContext->mdlList[i].size)
 		{
 			PMDLInfo info = &fileContext->mdlList[i];
 
 			/* tell the device about the unmapping */
-			deviceContext->regs->addr.q = info->id;
+			deviceContext->regs->addr.QuadPart = info->id;
+			_ReadWriteBarrier();
 			deviceContext->regs->cr |= PH_REG_CR_UNMAP;
 			wait_device(deviceContext->regs, PH_REG_CR_UNMAP, 0);
 
@@ -140,9 +143,10 @@ VOID PortholeDeviceFileCleanup(WDFFILEOBJECT FileObject)
 			free_mdl(info->mdl);
 			info->size = 0;
 		}
+	KeReleaseSpinLock(&deviceContext->deviceLock, oldIRQL);
 }
 
-static void wait_device(PortholeDeviceRegisters *regs, UINT32 mask, UINT32 value)
+static void wait_device(PortholeDeviceRegisters *regs, const UINT32 mask, const UINT32 value)
 {
 	LARGE_INTEGER delay = { 1 };
 	while ((regs->cr & mask) != value)
@@ -178,9 +182,10 @@ static NTSTATUS send_segment(PortholeDeviceRegisters *regs, UINT64 addr, UINT32 
 		return result;
 
 	/* send the segment */
-	regs->addr.q = addr;
-	regs->size   = size;
-	regs->cr     = PH_REG_CR_ADD_SEGMENT;
+	regs->addr.QuadPart = addr;
+	regs->size          = size;
+	_ReadWriteBarrier();
+	regs->cr    |= PH_REG_CR_ADD_SEGMENT;
 
 	return STATUS_SUCCESS;
 }
@@ -249,13 +254,18 @@ static NTSTATUS ioctl_send_msg(
 
 	NTSTATUS result;
 
+	KIRQL oldIRQL;
+	KeAcquireSpinLock(&DeviceContext->deviceLock, &oldIRQL);
+
 	/* tell the device we are about to send a list of segments */
-	DeviceContext->regs->cr = PH_REG_CR_START;
+	_ReadWriteBarrier();
+	DeviceContext->regs->cr |= PH_REG_CR_START;
 	wait_device(DeviceContext->regs, PH_REG_CR_START, 0x0);
 	if (!NT_SUCCESS(result = check_success(DeviceContext->regs)))
 	{
 		free_mdl(mdl);
 		mdlInfo->size = 0;
+		KeReleaseSpinLock(&DeviceContext->deviceLock, oldIRQL);
 		return result;
 	}
 
@@ -272,6 +282,7 @@ static NTSTATUS ioctl_send_msg(
 		{
 			const UINT64 curPA    = (*pfn << PAGE_SHIFT) + pageOffset;
 			const ULONG  pageSize = min(PAGE_SIZE - pageOffset, remaining);
+
 			remaining -= pageSize;
 			pageOffset = 0;
 
@@ -294,6 +305,7 @@ static NTSTATUS ioctl_send_msg(
 			{
 				free_mdl(mdl);
 				mdlInfo->size = 0;
+				KeReleaseSpinLock(&DeviceContext->deviceLock, oldIRQL);
 				return result;
 			}
 
@@ -308,6 +320,7 @@ static NTSTATUS ioctl_send_msg(
 	{
 		free_mdl(mdl);
 		mdlInfo->size = 0;
+		KeReleaseSpinLock(&DeviceContext->deviceLock, oldIRQL);
 		return result;
 	}
 
@@ -317,19 +330,26 @@ static NTSTATUS ioctl_send_msg(
 	{
 		free_mdl(mdl);
 		mdlInfo->size = 0;
+		KeReleaseSpinLock(&DeviceContext->deviceLock, oldIRQL);
 		return result;
 	}
 
 	/* send the final message */
 	DeviceContext->regs->type = input->type;
-	DeviceContext->regs->cr   = PH_REG_CR_FINISH;
+	_ReadWriteBarrier();
+	DeviceContext->regs->cr  |= PH_REG_CR_FINISH;
 	wait_device(DeviceContext->regs, PH_REG_CR_FINISH, 0x0);
 	result = check_success(DeviceContext->regs);
 	if (!NT_SUCCESS(result))
+	{
+		KeReleaseSpinLock(&DeviceContext->deviceLock, oldIRQL);
 		return result;
+	}
 
 	/* the mapping ID will be in the lower address register */
-	mdlInfo->id = DeviceContext->regs->addr.l;
+	mdlInfo->id = DeviceContext->regs->addr.LowPart;
+	KeReleaseSpinLock(&DeviceContext->deviceLock, oldIRQL);
+
 	*output = mdlInfo->id;
 	*BytesReturned = sizeof(PortholeMapID);
 	return STATUS_SUCCESS;
@@ -356,22 +376,30 @@ static NTSTATUS ioctl_unlock_buffer(
 	if (!NT_SUCCESS(WdfRequestRetrieveInputBuffer(Request, sizeof(PortholeMapID), (PVOID *)&input, NULL)))
 		return STATUS_INVALID_USER_BUFFER;
 
+	KIRQL oldIRQL;
+	KeAcquireSpinLock(&DeviceContext->deviceLock, &oldIRQL);
 	for (int i = 0; i < PORTHOLE_MAX_LOCKS; ++i)
 		if (FileContext->mdlList[i].size > 0 && FileContext->mdlList[i].id == *input)
 		{
 			PMDLInfo info = &FileContext->mdlList[i];
 
-			DeviceContext->regs->addr.q = info->id;
+			DeviceContext->regs->addr.QuadPart = info->id;
+			_ReadWriteBarrier();
 			DeviceContext->regs->cr |= PH_REG_CR_UNMAP;
 			wait_device(DeviceContext->regs, PH_REG_CR_UNMAP, 0);
 			NTSTATUS result = check_success(DeviceContext->regs);
 			if (!NT_SUCCESS(result))
+			{
+				KeReleaseSpinLock(&DeviceContext->deviceLock, oldIRQL);
 				return result;
+			}
 
 			free_mdl(info->mdl);
 			info->size = 0;
+			KeReleaseSpinLock(&DeviceContext->deviceLock, oldIRQL);
 			return STATUS_SUCCESS;
 		}
 
+	KeReleaseSpinLock(&DeviceContext->deviceLock, oldIRQL);
 	return STATUS_INVALID_ADDRESS;
 }

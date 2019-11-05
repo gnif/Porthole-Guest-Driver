@@ -27,21 +27,15 @@ EXTERN_C_START
 #pragma align(push, 4)
 typedef struct PortholeDeviceRegisters
 {
-	volatile UINT32 cr;
-	volatile UINT32 type;
+	volatile ULONG cr;
+	volatile ULONG type;
 
-	volatile union addr
-	{
-		UINT64 q;
-		UINT32 l;
-		UINT32 h;
-	}
-	addr;
-	volatile UINT32 size;
+	volatile PHYSICAL_ADDRESS addr;
+	volatile ULONG size;
 
-	volatile UINT32 reserved1;
-	volatile UINT32 reserved2;
-	volatile UINT32 reserved3;
+	volatile ULONG reserved1;
+	volatile ULONG reserved2;
+	volatile ULONG reserved3;
 }
 PortholeDeviceRegisters, *PPortholeDeviceRegisters;
 #pragma align(pop)
@@ -60,6 +54,7 @@ PortholeDeviceRegisters, *PPortholeDeviceRegisters;
 typedef struct _DEVICE_CONTEXT
 {
 	PPortholeDeviceRegisters regs;
+	KSPIN_LOCK deviceLock;
 }
 DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
