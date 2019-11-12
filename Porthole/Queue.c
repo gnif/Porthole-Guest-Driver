@@ -243,7 +243,7 @@ IOCTL_FN(ioctl_send_msg)
 		return STATUS_INVALID_USER_BUFFER;
 
 	/* ensure the supplied buffer size is valid */
-	if (input->size == 0)
+	if (input->size == 0 || !input->addr)
 		return STATUS_INVALID_USER_BUFFER;
 
 	/* find a free mdl and reserve it */
