@@ -27,11 +27,22 @@ SOFTWARE.
 #pragma alloc_text (PAGE, PortholeQueueInitialize)
 #endif
 
+#define IOCTL_FN(func) \
+	static NTSTATUS func(								\
+		const PDEVICE_CONTEXT		DeviceContext,		\
+		const PFILE_OBJECT_CONTEXT	FileContext,		\
+		const size_t				OutputBufferLength,	\
+		const size_t				InputBufferLength,	\
+		const WDFREQUEST			Request,			\
+		size_t *					BytesReturned)
+
 // forwards
 static void wait_device(PortholeDeviceRegisters *regs, const UINT32 mask, const UINT32 value);
 static NTSTATUS check_success(const PortholeDeviceRegisters *regs);
-static NTSTATUS ioctl_send_msg(const PDEVICE_CONTEXT DeviceContext, const PFILE_OBJECT_CONTEXT fileContext, const size_t OutputBufferLength, const size_t InputBufferLength, const WDFREQUEST Request, size_t * BytesReturned);
-static NTSTATUS ioctl_unlock_buffer(const PDEVICE_CONTEXT DeviceContext, const PFILE_OBJECT_CONTEXT fileContext, const size_t OutputBufferLength, const size_t InputBufferLength, const WDFREQUEST Request, size_t * BytesReturned);
+
+IOCTL_FN(ioctl_send_msg);
+IOCTL_FN(ioctl_unlock_buffer);
+IOCTL_FN(ioctl_register_events);
 
 void free_mdl(PMDL mdl)
 {
@@ -79,16 +90,19 @@ PortholeEvtIoDeviceControl(
 	NTSTATUS             status        = STATUS_INVALID_DEVICE_REQUEST;
 	size_t               bytesReturned = 0;
 
+#define HANDLER(msg, fn)	\
+	case msg: \
+		status = fn(deviceContext, fileContext, OutputBufferLength, InputBufferLength, Request, &bytesReturned); \
+		break;
+
 	switch (IoControlCode)
 	{
-		case IOCTL_PORTHOLE_SEND_MSG:
-			status = ioctl_send_msg(deviceContext, fileContext, OutputBufferLength, InputBufferLength, Request, &bytesReturned);
-			break;
-
-		case IOCTL_PORTHOLE_UNLOCK_BUFFER:
-			status = ioctl_unlock_buffer(deviceContext, fileContext, OutputBufferLength, InputBufferLength, Request, &bytesReturned);
-			break;
+		HANDLER(IOCTL_PORTHOLE_SEND_MSG       , ioctl_send_msg       );
+		HANDLER(IOCTL_PORTHOLE_UNLOCK_BUFFER  , ioctl_unlock_buffer  );
+		HANDLER(IOCTL_PORTHOLE_REGISTER_EVENTS, ioctl_register_events);
 	}
+
+#undef HANDLER
 
 	// a disconnect invalidates all mappings
 	if (status == STATUS_DEVICE_NOT_CONNECTED)
@@ -144,6 +158,28 @@ VOID PortholeDeviceFileCleanup(WDFFILEOBJECT FileObject)
 			info->size = 0;
 		}
 	KeReleaseSpinLock(&deviceContext->deviceLock, oldIRQL);
+
+	KeAcquireSpinLock(&deviceContext->eventListLock, &oldIRQL);
+	PLIST_ENTRY nextEntry;
+	for (PLIST_ENTRY entry = deviceContext->eventList.Flink; entry != &deviceContext->eventList; entry = nextEntry)
+	{
+		nextEntry = entry->Flink;
+
+		PPORTHOLE_EVENT record = CONTAINING_RECORD(entry, PORTHOLE_EVENT, listEntry);
+		if (record->owner != fileContext)
+			continue;
+
+		RemoveEntryList(entry);
+
+		if (record->connect)
+			ObDereferenceObject(record->connect);
+
+		if (record->disconnect)
+			ObDereferenceObject(record->disconnect);
+
+		ExFreePoolWithTag(record, TAG);
+	}
+	KeReleaseSpinLock(&deviceContext->eventListLock, oldIRQL);
 }
 
 static void wait_device(PortholeDeviceRegisters *regs, const UINT32 mask, const UINT32 value)
@@ -190,14 +226,7 @@ static NTSTATUS send_segment(PortholeDeviceRegisters *regs, UINT64 addr, UINT32 
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS ioctl_send_msg(
-	const PDEVICE_CONTEXT      DeviceContext,
-	const PFILE_OBJECT_CONTEXT FileContext,
-	const size_t               OutputBufferLength,
-	const size_t               InputBufferLength,
-	const WDFREQUEST           Request,
-	size_t                   * BytesReturned
-)
+IOCTL_FN(ioctl_send_msg)
 {
 	if (InputBufferLength != sizeof(PortholeMsg))
 		return STATUS_INVALID_BUFFER_SIZE;
@@ -355,16 +384,8 @@ static NTSTATUS ioctl_send_msg(
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS ioctl_unlock_buffer(
-	const PDEVICE_CONTEXT      DeviceContext,
-	const PFILE_OBJECT_CONTEXT FileContext,
-	const size_t               OutputBufferLength,
-	const size_t               InputBufferLength,
-	const WDFREQUEST           Request,
-	size_t                   * BytesReturned
-)
+IOCTL_FN(ioctl_unlock_buffer)
 {
-	UNREFERENCED_PARAMETER(DeviceContext);
 	UNREFERENCED_PARAMETER(OutputBufferLength);
 	UNREFERENCED_PARAMETER(BytesReturned);
 
@@ -402,4 +423,58 @@ static NTSTATUS ioctl_unlock_buffer(
 
 	KeReleaseSpinLock(&DeviceContext->deviceLock, oldIRQL);
 	return STATUS_INVALID_ADDRESS;
+}
+
+IOCTL_FN(ioctl_register_events)
+{
+	UNREFERENCED_PARAMETER(BytesReturned);
+	UNREFERENCED_PARAMETER(OutputBufferLength);
+
+	PPortholeEvents input;
+
+	if (InputBufferLength != sizeof(PortholeEvents))
+		return STATUS_INVALID_BUFFER_SIZE;
+
+	if (!NT_SUCCESS(WdfRequestRetrieveInputBuffer(Request, sizeof(PortholeEvents), (PVOID *)&input, NULL)))
+		return STATUS_INVALID_USER_BUFFER;
+
+	PPORTHOLE_EVENT record = ExAllocatePoolWithQuotaTag(NonPagedPool, sizeof(PORTHOLE_EVENT), TAG);
+	if (!record)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	RtlZeroMemory(record, sizeof(PORTHOLE_EVENT));
+	record->owner = FileContext;
+
+	PIRP irp = WdfRequestWdmGetIrp(Request);
+	if (input->connect != (HANDLE)-1)
+	{
+		if (!NT_SUCCESS(ObReferenceObjectByHandle(input->connect, SYNCHRONIZE | EVENT_MODIFY_STATE, *ExEventObjectType, irp->RequestorMode, &record->connect, NULL)))
+			goto invalid_handle;
+
+		/* signal the event if there is already a connection */
+		if (DeviceContext->connected)
+			KeSetEvent(record->connect, 0, FALSE);
+		else
+			KeResetEvent(record->connect);
+	}
+
+	if (input->disconnect != (HANDLE)-1)
+	{
+		if (!NT_SUCCESS(ObReferenceObjectByHandle(input->disconnect, SYNCHRONIZE | EVENT_MODIFY_STATE, *ExEventObjectType, irp->RequestorMode, &record->disconnect, NULL)))
+			goto invalid_handle;
+		KeResetEvent(record->disconnect);
+	}
+
+	ExInterlockedInsertTailList(
+		&DeviceContext->eventList,
+		&record->listEntry,
+		&DeviceContext->eventListLock);
+
+	return STATUS_SUCCESS;
+
+invalid_handle:
+	if (input->connect)
+		ObDereferenceObject(input->connect);
+	ExFreePoolWithTag(record, TAG);
+	return STATUS_INVALID_HANDLE;
 }

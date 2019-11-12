@@ -44,6 +44,7 @@ int main()
 	SP_DEVICE_INTERFACE_DATA		 devInfData = { 0 };
 	DWORD                            reqSize    = 0;
 	ULONG                            returned;
+	HANDLE                           connectEvent, disconnectEvent;
 
 	devInfData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 	deviceInfoSet     = SetupDiGetClassDevs(NULL, NULL, NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES | DIGCF_DEVICEINTERFACE);
@@ -62,6 +63,18 @@ int main()
 	SetupDiGetDeviceInterfaceDetail(deviceInfoSet, &devInfData, infData, reqSize, NULL, NULL);
 	devHandle = CreateFile(infData->DevicePath, 0, 0, NULL, OPEN_EXISTING, 0, 0);
 	free(infData);
+	
+	// register events
+	PortholeEvents events;
+	events.connect    = CreateEvent(NULL, TRUE, FALSE, NULL);
+	events.disconnect = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+	DeviceIoControl(devHandle, IOCTL_PORTHOLE_REGISTER_EVENTS, &events,
+		sizeof(PortholeEvents), NULL, 0, &returned, NULL);
+
+	// wait for a connection
+	printf("waiting for connect event.\n");
+	while (WaitForSingleObject(events.connect, INFINITE) != WAIT_OBJECT_0)	{}
 
 #define RING_SIZE (16384)
 
@@ -94,6 +107,12 @@ int main()
 		&returned,
 		NULL);
 
+	// wait for disconect
+	printf("wating for disconnect event.\n");
+	while (WaitForSingleObject(events.disconnect, INFINITE) != WAIT_OBJECT_0) {}
+	
 	CloseHandle(devHandle);
+	CloseHandle(events.connect);
+	CloseHandle(events.disconnect);
 	return 0;
 }

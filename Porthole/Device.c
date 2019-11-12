@@ -29,6 +29,11 @@ SOFTWARE.
 #pragma alloc_text (PAGE, PortholeReleaseHardware)
 #endif
 
+EVT_WDF_INTERRUPT_ISR     PortholeInterruptISR;
+EVT_WDF_INTERRUPT_DPC     PortholeInterruptDPC;
+EVT_WDF_INTERRUPT_ENABLE  PortholeInterruptEnable;
+EVT_WDF_INTERRUPT_DISABLE PortholeInterruptDisable;
+
 NTSTATUS PortholeCreateDevice(_Inout_ PWDFDEVICE_INIT DeviceInit)
 {
     WDF_OBJECT_ATTRIBUTES attributes;
@@ -57,10 +62,12 @@ NTSTATUS PortholeCreateDevice(_Inout_ PWDFDEVICE_INIT DeviceInit)
 
     deviceContext = DeviceGetContext(device);
 	RtlZeroMemory(deviceContext, sizeof(DEVICE_CONTEXT));
-	KeInitializeSpinLock(&deviceContext->deviceLock);
+
+	KeInitializeSpinLock(&deviceContext->deviceLock   );
+	KeInitializeSpinLock(&deviceContext->eventListLock);
+	InitializeListHead(&deviceContext->eventList);
 
     status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_PORTHOLE, NULL);
-
 	if (!NT_SUCCESS(status))
 		return status;
 
@@ -73,20 +80,61 @@ NTSTATUS PortholeCreateDevice(_Inout_ PWDFDEVICE_INIT DeviceInit)
 
 NTSTATUS PortholePrepareHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourceRaw, _In_ WDFCMRESLIST ResourceTranslated)
 {
-	UNREFERENCED_PARAMETER(ResourceRaw);
-
-	PAGED_CODE();
 	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
 	
-	PCM_PARTIAL_RESOURCE_DESCRIPTOR descriptor;
-	descriptor = WdfCmResourceListGetDescriptor(ResourceTranslated, 0);
-	if (descriptor->u.Memory.Length < sizeof(PortholeDeviceRegisters))
+	const ULONG resCount = WdfCmResourceListGetCount(ResourceTranslated);
+	for (ULONG i = 0; i < resCount; ++i)
+	{
+		PCM_PARTIAL_RESOURCE_DESCRIPTOR descriptor;
+		descriptor = WdfCmResourceListGetDescriptor(ResourceTranslated, i);
+		if (!descriptor)
+			return STATUS_DEVICE_CONFIGURATION_ERROR;
+
+		if (!deviceContext->regs && descriptor->Type == CmResourceTypeMemory)
+		{
+			if (descriptor->u.Memory.Length != sizeof(PortholeDeviceRegisters))
+				continue;
+
+			deviceContext->regs = (PPortholeDeviceRegisters)
+				MmMapIoSpace(descriptor->u.Memory.Start, sizeof(PortholeDeviceRegisters), MmNonCached);
+			break;
+		}
+	}
+
+	if (!deviceContext->regs)
 		return STATUS_DEVICE_HARDWARE_ERROR;
 
-	deviceContext->regs = (PPortholeDeviceRegisters)
-		MmMapIoSpace(descriptor->u.Memory.Start, sizeof(PortholeDeviceRegisters), MmNonCached);
+	NTSTATUS status = STATUS_DEVICE_HARDWARE_ERROR;
+	for (ULONG i = 0; i < resCount; ++i)
+	{
+		PCM_PARTIAL_RESOURCE_DESCRIPTOR descriptor;
+		descriptor = WdfCmResourceListGetDescriptor(ResourceTranslated, i);
+		if (!descriptor)
+		{
+			status = STATUS_DEVICE_CONFIGURATION_ERROR;
+			break;
+		}
 
-	return STATUS_SUCCESS;
+		if (descriptor->Type == CmResourceTypeInterrupt && !(descriptor->Flags & CM_RESOURCE_INTERRUPT_MESSAGE))
+		{
+			WDF_INTERRUPT_CONFIG irqConfig;
+			WDF_INTERRUPT_CONFIG_INIT(&irqConfig, PortholeInterruptISR, PortholeInterruptDPC);
+			irqConfig.InterruptTranslated = descriptor;
+			irqConfig.InterruptRaw        = WdfCmResourceListGetDescriptor(ResourceRaw, i);
+			irqConfig.EvtInterruptEnable  = PortholeInterruptEnable;
+			irqConfig.EvtInterruptDisable = PortholeInterruptDisable;
+			status = WdfInterruptCreate(Device, &irqConfig, WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->interrupt);
+			if (!NT_SUCCESS(status))
+				break;
+			
+			deviceContext->connected = (deviceContext->regs->cr & PH_REG_CR_NOCONN) == 0x0 ? TRUE : FALSE;
+			return STATUS_SUCCESS;
+		}
+	}
+
+	MmUnmapIoSpace(deviceContext->regs, sizeof(PortholeDeviceRegisters));
+	deviceContext->regs = NULL;
+	return status;
 }
 
 NTSTATUS PortholeReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST ResourceTranslated)
@@ -96,7 +144,89 @@ NTSTATUS PortholeReleaseHardware(_In_ WDFDEVICE Device, _In_ WDFCMRESLIST Resour
 	PAGED_CODE();
 	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
 
-	MmUnmapIoSpace(deviceContext->regs, sizeof(PortholeDeviceRegisters));
+	// disable interrupts
+	deviceContext->regs->cr &= (~PH_REG_CR_IRQ);
+
+	// dereference and free the event list
+	KIRQL oldIRQL;
+	KeAcquireSpinLock(&deviceContext->eventListLock, &oldIRQL);
+	while (!IsListEmpty(&deviceContext->eventList))
+	{
+		PLIST_ENTRY     entry  = RemoveTailList(&deviceContext->eventList);
+		PPORTHOLE_EVENT record = CONTAINING_RECORD(entry, PORTHOLE_EVENT, listEntry);
+
+		if (record->connect)
+			ObDereferenceObject(record->connect);
+
+		if (record->disconnect)
+			ObDereferenceObject(record->disconnect);
+
+		ExFreePoolWithTag(record, TAG);
+	}
+	KeReleaseSpinLock(&deviceContext->eventListLock, oldIRQL);
+
+	// unmap the io space
+	if (deviceContext->regs)
+		MmUnmapIoSpace(deviceContext->regs, sizeof(PortholeDeviceRegisters));
 
 	return STATUS_SUCCESS;
+}
+
+NTSTATUS PortholeInterruptEnable(WDFINTERRUPT Interrupt, WDFDEVICE Device)
+{
+	UNREFERENCED_PARAMETER(Interrupt);
+
+	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
+	deviceContext->regs->cr |= PH_REG_CR_IRQ;
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS PortholeInterruptDisable(WDFINTERRUPT Interrupt, WDFDEVICE Device)
+{
+	UNREFERENCED_PARAMETER(Interrupt);
+
+	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
+	deviceContext->regs->cr &= (~PH_REG_CR_IRQ);
+	return STATUS_SUCCESS;
+}
+
+BOOLEAN PortholeInterruptISR(WDFINTERRUPT Interrupt, ULONG MessageID)
+{
+	UNREFERENCED_PARAMETER(MessageID);
+
+	WDFDEVICE       device        = WdfInterruptGetDevice(Interrupt);
+	PDEVICE_CONTEXT deviceContext = DeviceGetContext(device);
+
+	if (deviceContext->regs->isr)
+		WdfInterruptQueueDpcForIsr(Interrupt);
+
+	return TRUE;
+}
+
+void PortholeInterruptDPC(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
+{
+	UNREFERENCED_PARAMETER(AssociatedObject);
+
+	WDFDEVICE       device        = WdfInterruptGetDevice(Interrupt);
+	PDEVICE_CONTEXT deviceContext = DeviceGetContext(device);
+
+	LONG isr = InterlockedExchange(&(LONG)deviceContext->regs->isr, 0xFFFFFFFF);
+	if (!isr)
+		return;
+
+	deviceContext->connected = (deviceContext->regs->cr & PH_REG_CR_NOCONN) == 0x0 ? TRUE : FALSE;
+
+	KeAcquireSpinLockAtDpcLevel(&deviceContext->eventListLock);
+	for (PLIST_ENTRY entry = deviceContext->eventList.Flink; entry != &deviceContext->eventList; entry = entry->Flink)
+	{
+		PPORTHOLE_EVENT record = CONTAINING_RECORD(entry, PORTHOLE_EVENT, listEntry);
+
+		// always flag disconnections first if both have happend in the same ISR
+		if ((isr & PH_REG_ISR_DISCONNECT) && record->disconnect)
+			KeSetEvent(record->disconnect, 0, FALSE);
+
+		if ((isr & PH_REG_ISR_CONNECT) && record->connect)
+			KeSetEvent(record->connect, 0, FALSE);
+	}
+	KeReleaseSpinLockFromDpcLevel(&deviceContext->eventListLock);
 }

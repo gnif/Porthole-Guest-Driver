@@ -40,12 +40,12 @@ CopyFiles=Drivers_Dir
 AddInterface={10ccc0ac-f4b0-4d78-ba41-1ebb385a5285}
 
 [Porthole_Device.NT.HW]
-AddReg=Porthole_AddReg
+;AddReg=Porthole_AddReg
 
-[Porthole_AddReg]
-HKR,Interrupt Management,,0x00000010
-HKR,Interrupt Management\MessageSignaledInterruptProperties,,0x00000010
-HKR,Interrupt Management\MessageSignaledInterruptProperties,MSISupported,0x00010001,1
+;[Porthole_AddReg]
+;HKR,Interrupt Management,,0x00000010
+;HKR,Interrupt Management\MessageSignaledInterruptProperties,,0x00000010
+;HKR,Interrupt Management\MessageSignaledInterruptProperties,MSISupported,0x00010001,1
 
 [Drivers_Dir]
 Porthole.sys
